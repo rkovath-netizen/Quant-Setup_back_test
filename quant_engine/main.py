@@ -1,9 +1,13 @@
-# quant_engine/main.py
-
 import os
+import sys
 import json
 import pandas as pd
 from datetime import datetime, timedelta
+
+# --- Force Python to recognize quant_engine directory for module imports ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
 
 from core.config import IST, TIMEFRAME_COMBOS
 from core.github_client import upload_file_to_github
@@ -21,7 +25,7 @@ def build_continuous_futures(symbol, start_date_str, token, logger=print):
         logger(f"CRITICAL: 0 expiries found for {symbol}.")
         return pd.DataFrame(), []
 
-    local_filename = f"{symbol}_continuous.csv"
+    local_filename = os.path.join(BASE_DIR, f"{symbol}_continuous.csv")
     if os.path.exists(local_filename):
         try:
             df = pd.read_csv(local_filename)
@@ -79,8 +83,7 @@ def build_continuous_futures(symbol, start_date_str, token, logger=print):
     return continuous_df, all_expiries
 
 def run_backtest():
-    # Load configuration parameters written by Streamlit app
-    config_file = "run_config.json"
+    config_file = os.path.join(BASE_DIR, "run_config.json")
     if not os.path.exists(config_file):
         print("❌ Error: run_config.json not found.")
         return
@@ -128,10 +131,10 @@ def run_backtest():
                 
         if symbol_trades:
             final_df = pd.concat(symbol_trades, ignore_index=True)
-            output_dir = "backtest_results"
+            output_dir = os.path.join(BASE_DIR, "backtest_results")
             os.makedirs(output_dir, exist_ok=True)
             
-            filename = f"{output_dir}/{symbol}_trades_{timestamp_str}.csv"
+            filename = os.path.join(output_dir, f"{symbol}_trades_{timestamp_str}.csv")
             final_df.to_csv(filename, index=False)
             print(f"Successfully saved {filename}")
             all_generated_files.append(filename)
