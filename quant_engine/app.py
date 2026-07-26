@@ -44,10 +44,21 @@ def get_running_pid():
 with st.sidebar:
     st.header("⚙️ Credentials & Parameters")
     
-    # Securely fetch defaults from Streamlit Secrets (if they exist)
-    default_upstox = st.secrets.get("UPSTOX_TOKEN", "") if hasattr(st, "secrets") else ""
-    default_github = st.secrets.get("GITHUB_TOKEN", "") if hasattr(st, "secrets") else ""
-    default_repo = st.secrets.get("GITHUB_REPO", "rkovath-netizen/Quant-Setup_back_test") if hasattr(st, "secrets") else "rkovath-netizen/Quant-Setup_back_test"
+    # Securely fetch defaults from Streamlit Secrets matching your exact variable names
+    try:
+        default_upstox = st.secrets.get("UPSTOX_API_TOKEN", "")
+        default_github = st.secrets.get("GITHUB_TOKEN", "")
+        default_repo = st.secrets.get("GITHUB_REPO", "rkovath-netizen/Quant-Setup_back_test")
+        
+        if default_upstox and default_github:
+            st.success("✅ Secure tokens successfully loaded from Cloud!")
+        else:
+            st.warning("⚠️ Secrets vault is empty. Please check Streamlit Settings.")
+    except Exception:
+        default_upstox = ""
+        default_github = ""
+        default_repo = "rkovath-netizen/Quant-Setup_back_test"
+        st.warning("⚠️ Streamlit Secrets are not configured.")
     
     upstox_token = st.text_input("Upstox Access Token", value=default_upstox, type="password")
     github_token = st.text_input("GitHub Token", value=default_github, type="password")
