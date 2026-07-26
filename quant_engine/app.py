@@ -1,5 +1,3 @@
-# quant_engine/app.py
-
 import os
 import sys
 import json
@@ -7,17 +5,24 @@ import time
 import subprocess
 import streamlit as st
 
+# --- Force Python to recognize quant_engine directory for module imports ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
 st.set_page_config(page_title="Quant Backtest Launcher", page_icon="📈", layout="centered")
 
 st.title("📈 Modular Backtest Controller")
 st.caption("Mobile-optimized UI with detached background execution & automatic GitHub upload")
 
-LOG_FILE = "background_execution.log"
-CONFIG_FILE = "run_config.json"
-PID_FILE = "backtest.pid"
+# Explicit paths inside quant_engine directory
+LOG_FILE = os.path.join(BASE_DIR, "background_execution.log")
+CONFIG_FILE = os.path.join(BASE_DIR, "run_config.json")
+PID_FILE = os.path.join(BASE_DIR, "backtest.pid")
+MAIN_SCRIPT = os.path.join(BASE_DIR, "main.py")
 
 def is_process_running(pid):
-    """Checks if the detached background process is actively running."""
+    """Checks if the background process is actively executing."""
     try:
         os.kill(pid, 0)
         return True
@@ -35,13 +40,13 @@ def get_running_pid():
             pass
     return None
 
-# --- SIDEBAR / INPUT CONFIGURATION ---
+# --- SIDEBAR INPUTS ---
 with st.sidebar:
     st.header("⚙️ Credentials & Parameters")
     
-    upstox_token = st.text_input("Upstox Access Token", type="password", help="Enter today's active Upstox access token")
-    github_token = st.text_input("GitHub Token", type="password", help="Personal Access Token with repository write permissions")
-    github_repo = st.text_input("GitHub Repo", value="rkovath-netizen/Index_stochastic_intraday", help="format: owner/repository_name")
+    upstox_token = st.text_input("Upstox Access Token", type="password")
+    github_token = st.text_input("GitHub Token", type="password")
+    github_repo = st.text_input("GitHub Repo", value="rkovath-netizen/Index_stochastic_intraday")
     
     st.divider()
     days = st.slider("Lookback Window (Days)", min_value=5, max_value=90, value=30, step=5)
@@ -49,7 +54,6 @@ with st.sidebar:
 
 running_pid = get_running_pid()
 
-# --- MAIN ACTION BUTTONS ---
 st.subheader("🚀 Execution Control")
 
 if running_pid:
@@ -65,7 +69,7 @@ else:
         elif not selected_symbols:
             st.error("Please select at least one instrument.")
         else:
-            # 1. Write current configuration parameters
+            # Save runtime configuration
             config_data = {
                 "upstox_token": upstox_token.strip(),
                 "github_token": github_token.strip() if github_token else "",
@@ -76,16 +80,16 @@ else:
             with open(CONFIG_FILE, "w") as f:
                 json.dump(config_data, f, indent=4)
 
-            # 2. Launch detached background process writing output to background_execution.log
+            # Launch detached process with cwd set to quant_engine
             with open(LOG_FILE, "w") as log_f:
                 proc = subprocess.Popen(
-                    [sys.executable, "main.py"],
+                    [sys.executable, MAIN_SCRIPT],
                     stdout=log_f,
                     stderr=subprocess.STDOUT,
-                    start_new_session=True  # Completely detaches process from Streamlit session
+                    cwd=BASE_DIR,  # Run execution strictly inside quant_engine directory
+                    start_new_session=True
                 )
                 
-            # 3. Store PID for process tracking
             with open(PID_FILE, "w") as pid_f:
                 pid_f.write(str(proc.pid))
 
@@ -94,14 +98,11 @@ else:
             st.rerun()
 
 st.divider()
-
-# --- REAL-TIME LOG MONITOR ---
 st.subheader("📜 Execution Log Output")
 
 if os.path.exists(LOG_FILE):
     with open(LOG_FILE, "r", encoding="utf-8", errors="ignore") as f:
         log_content = f.read()
-    
     st.code(log_content[-4000:] if len(log_content) > 4000 else log_content, language="text")
 else:
     st.info("No log file found yet. Click 'Launch Background Backtest' to start.")
