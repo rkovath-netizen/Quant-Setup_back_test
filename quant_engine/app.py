@@ -81,7 +81,8 @@ with tab1:
             }
             with open(os.path.join(BASE_DIR, "run_config.json"), "w") as f: json.dump(config_data, f)
             with open(LOG_FILE_BT, "w") as log_f:
-                proc = subprocess.Popen([sys.executable, "main.py"], stdout=log_f, stderr=subprocess.STDOUT, cwd=BASE_DIR, start_new_session=True)
+                # ADDED -u HERE FOR UNBUFFERED LOGS
+                proc = subprocess.Popen([sys.executable, "-u", "main.py"], stdout=log_f, stderr=subprocess.STDOUT, cwd=BASE_DIR, start_new_session=True)
             with open(PID_FILE_BT, "w") as pid_f: pid_f.write(str(proc.pid))
             st.success("Started! You can close your phone.")
             time.sleep(1)
@@ -120,7 +121,8 @@ with tab2:
                 }
                 with open(CONFIG_FILE_SCAN, "w") as f: json.dump(config_data, f)
                 with open(LOG_FILE_SCAN, "w") as log_f:
-                    proc = subprocess.Popen([sys.executable, "live_scanner.py"], stdout=log_f, stderr=subprocess.STDOUT, cwd=BASE_DIR, start_new_session=True)
+                    # ADDED -u HERE FOR UNBUFFERED LOGS
+                    proc = subprocess.Popen([sys.executable, "-u", "live_scanner.py"], stdout=log_f, stderr=subprocess.STDOUT, cwd=BASE_DIR, start_new_session=True)
                 with open(PID_FILE_SCAN, "w") as pid_f: pid_f.write(str(proc.pid))
                 st.success("Scanner deployed! Waiting for signals...")
                 time.sleep(1)
