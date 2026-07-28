@@ -13,24 +13,7 @@ if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
 from core.config import IST
-
-def get_front_month_future(symbol_prefix):
-    """Robustly fetches the active front-month future contract key."""
-    url = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
-    try:
-        df = pd.read_csv(url)
-        df.columns = df.columns.str.strip().str.lower()
-        ex_col = 'exchange' if 'exchange' in df.columns else 'segment'
-        df_f = df[(df[ex_col] == 'NSE_FO') & (df['instrument_type'] == 'FUTIDX') & (df['name'] == symbol_prefix)]
-        if df_f.empty: return None
-        df_f['expiry'] = pd.to_datetime(df_f['expiry']).dt.date
-        today = datetime.now(IST).date()
-        active_contracts = df_f[df_f['expiry'] >= today].sort_values('expiry')
-        if not active_contracts.empty:
-            return active_contracts.iloc[0]['instrument_key']
-    except Exception:
-        pass
-    return None
+from data.instrument_master import get_all_expiries, resolve_exact_contract
 
 def fetch_unified_data(instrument_key, token, days=5):
     """Fetches 1-minute historical and intraday data and stitches them."""
@@ -42,12 +25,10 @@ def fetch_unified_data(instrument_key, token, days=5):
     to_str = now.strftime('%Y-%m-%d')
     from_str = start_date.strftime('%Y-%m-%d')
     
-    # Historical Fetch (1-minute)
     hist_url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/1minute/{to_str}/{from_str}"
     hist_res = requests.get(hist_url, headers=headers)
     hist_data = hist_res.json().get('data', {}).get('candles', []) if hist_res.status_code == 200 else []
     
-    # Intraday Fetch (1-minute)
     intra_url = f"https://api.upstox.com/v2/historical-candle/intraday/{encoded_key}/1minute"
     intra_res = requests.get(intra_url, headers=headers)
     intra_data = intra_res.json().get('data', {}).get('candles', []) if intra_res.status_code == 200 else []
@@ -92,17 +73,23 @@ def run_vwap_debugger(symbol="NIFTY"):
 
     print(f"🔄 Fetching data for {symbol}...")
     
-    future_key = get_front_month_future(symbol)
-    if not future_key:
-        print("❌ Failed to resolve front-month futures contract.")
+    # --- USE CORE INSTRUMENT MASTER TO RESOLVE CONTRACT ---
+    all_expiries = get_all_expiries(symbol, token, logger=lambda x: None)
+    if not all_expiries: 
+        print(f"❌ Failed to fetch expiries for {symbol}.")
         return
+        
+    future_key = resolve_exact_contract(symbol, all_expiries[0], token, inst_type="FUTIDX", logger=lambda x: None)
+    if not future_key:
+        print(f"❌ Failed to resolve front-month futures contract for {symbol}.")
+        return
+    # ------------------------------------------------------
 
     df_1m = fetch_unified_data(future_key, token, days=5)
     if df_1m.empty:
-        print("❌ No data returned from API. Token might be expired.")
+        print("❌ No data returned from API.")
         return
 
-    # Process indicators
     df_3m = resample_candles(df_1m, '3min')
     df_15m = resample_candles(df_1m, '15min')
     
@@ -117,7 +104,6 @@ def run_vwap_debugger(symbol="NIFTY"):
     df = pd.merge_asof(df_3m.reset_index(), df_15m.reset_index(), on='timestamp', direction='backward')
     df.set_index('timestamp', inplace=True)
 
-    # Isolate Latest Date
     df['date'] = df.index.date
     latest_date = df['date'].max()
     day_df = df[df['date'] == latest_date].copy()
@@ -132,11 +118,9 @@ def run_vwap_debugger(symbol="NIFTY"):
         time_str = idx.strftime('%H:%M')
         time_obj = idx.time()
         
-        # Market hours filter (09:15 to 15:30)
         if not (dtime(9, 15) <= time_obj <= dtime(15, 30)):
             continue
 
-        # 15m BIAS
         bias_ce = (row['close_15m'] > row['VWAP_15m']) and (row['EMA_9_15m'] > row['EMA_21_15m'])
         bias_pe = (row['close_15m'] < row['VWAP_15m']) and (row['EMA_9_15m'] < row['EMA_21_15m'])
         
@@ -164,7 +148,7 @@ def run_vwap_debugger(symbol="NIFTY"):
             rej_pe = (row['close'] < row['open']) and (row['close'] < row['EMA_9'])
             
             pb_str = str(bool(pb_pe))
-            vol_str = "N/A" # Volume rule not applied to short setups in V2
+            vol_str = "N/A"
             rej_str = str(bool(rej_pe))
             
             if pb_pe and rej_pe:
@@ -173,7 +157,6 @@ def run_vwap_debugger(symbol="NIFTY"):
                 else:
                     result_str = "🔥 PE SIGNAL! (VALID ENTRY)"
         
-        # Only print rows where Bias exists or some condition is met to keep logs readable
         if bias_ce or bias_pe:
             print(f"{time_str:<10} | {bias_str:<8} | {pb_str:<10} | {vol_str:<10} | {rej_str:<10} | {result_str}")
 
