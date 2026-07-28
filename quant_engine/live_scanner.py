@@ -3,10 +3,8 @@ import sys
 import time
 import json
 import pandas as pd
-import pandas_ta as ta
 from datetime import datetime, timedelta
 
-# Ensure quant_engine directory is in Python path
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
@@ -15,97 +13,149 @@ from core.config import IST
 from data.instrument_master import get_all_expiries, resolve_exact_contract
 from data.candle_fetcher import fetch_candle_chunk
 from core.notifier import send_email_alert
+from strategies.vwap_ema_v2 import generate_v2_signals
 
-def calculate_indicators_and_rr(df, ltf_k=14, ltf_d=3, htf_ema=50, atr_period=14, rr_ratio=2.0):
-    df = df.copy()
-    df['EMA_50'] = ta.ema(df['close'], length=htf_ema)
-    
-    stoch = ta.stoch(df['high'], df['low'], df['close'], k=ltf_k, d=ltf_d)
-    if stoch is not None and not stoch.empty:
-        df['STOCH_K'] = stoch[f'STOCHk_{ltf_k}_{ltf_d}_3']
-        df['STOCH_D'] = stoch[f'STOCHd_{ltf_k}_{ltf_d}_3']
-    else:
-        df['STOCH_K'] = 50.0
-        df['STOCH_D'] = 50.0
+TIMESTAMP_STR = datetime.now(IST).strftime("%Y%m%d")
+TRADE_LOG_FILE = os.path.join(BASE_DIR, f"Live_Debugger_V2_{TIMESTAMP_STR}.xlsx")
 
-    df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=atr_period)
+OPEN_TRADES = {"NIFTY": None, "SENSEX": None}
+INSTRUMENT_CONFIG = {
+    "NIFTY": {"default_lot": 25, "target_pts": 25, "sl_pts": 15},
+    "SENSEX": {"default_lot": 10, "target_pts": 75, "sl_pts": 45} # Scaled for Sensex volatility
+}
 
-    df['Signal'] = 0
-    df['Entry'] = 0.0
-    df['SL'] = 0.0
-    df['TP'] = 0.0
-
-    for i in range(1, len(df)):
-        prev_k, prev_d = df['STOCH_K'].iloc[i-1], df['STOCH_D'].iloc[i-1]
-        curr_k, curr_d = df['STOCH_K'].iloc[i], df['STOCH_D'].iloc[i]
-        price = df['close'].iloc[i]
-        ema = df['EMA_50'].iloc[i]
-        atr = df['ATR'].iloc[i] if not pd.isna(df['ATR'].iloc[i]) else price * 0.005
-
-        if price > ema and prev_k < prev_d and curr_k > curr_d and prev_k <= 30:
-            sl_distance = max(atr * 1.2, price * 0.0025)
-            tp_distance = sl_distance * rr_ratio
-            df.iloc[i, df.columns.get_loc('Signal')] = 1
-            df.iloc[i, df.columns.get_loc('Entry')] = round(price, 2)
-            df.iloc[i, df.columns.get_loc('SL')] = round(price - sl_distance, 2)
-            df.iloc[i, df.columns.get_loc('TP')] = round(price + tp_distance, 2)
-
-        elif price < ema and prev_k > prev_d and curr_k < curr_d and prev_k >= 70:
-            sl_distance = max(atr * 1.2, price * 0.0025)
-            tp_distance = sl_distance * rr_ratio
-            df.iloc[i, df.columns.get_loc('Signal')] = -1
-            df.iloc[i, df.columns.get_loc('Entry')] = round(price, 2)
-            df.iloc[i, df.columns.get_loc('SL')] = round(price + sl_distance, 2)
-            df.iloc[i, df.columns.get_loc('TP')] = round(price - tp_distance, 2)
-
-    return df
-
-def scan_symbol(symbol, token, lookback_days=3):
-    today_str = datetime.now(IST).strftime('%Y-%m-%d')
-    start_str = (datetime.now(IST) - timedelta(days=lookback_days)).strftime('%Y-%m-%d')
-    
-    all_expiries = get_all_expiries(symbol, token, logger=print)
-    if not all_expiries: return None
-
-    near_expiry = all_expiries[0]
-    future_key = resolve_exact_contract(symbol, near_expiry, token, inst_type="FUTIDX", logger=print)
-    if not future_key: return None
-
-    df = fetch_candle_chunk(future_key, start_str, today_str, token, interval='5minute', logger=print)
-    if df.empty: return None
-
-    scanned_df = calculate_indicators_and_rr(df, rr_ratio=2.0)
-    latest_bar = scanned_df.iloc[-1]
-    latest_time = scanned_df.index[-1]
-    signal = latest_bar['Signal']
-    
-    if signal != 0:
-        opt_type = "CE" if signal == 1 else "PE"
-        strike_step = 100 if symbol == "SENSEX" else 50
-        atm_strike = int(round(latest_bar['Entry'] / strike_step) * strike_step)
+def initialize_excel_log():
+    """Initializes the Daily Excel Debugger for validation."""
+    if not os.path.exists(TRADE_LOG_FILE):
+        conditions = [
+            "STRATEGY ENTRY AND EXIT CONDITIONS (V2)",
+            "15-MINUTE BIAS",
+            "- BUY CE: 15m Close > 15m VWAP AND 15m 9 EMA > 15m 21 EMA",
+            "- BUY PE: 15m Close < 15m VWAP AND 15m 9 EMA < 15m 21 EMA",
+            "3-MINUTE ENTRY TRIGGER",
+            "- Pullback touching 9 EMA or VWAP + Vol Expansion + Rejection",
+            "RISK MANAGEMENT",
+            "- Target/SL predefined per instrument.",
+            "- No new entries >= 14:00 IST",
+            "- Auto Square-Off at 15:15 IST"
+        ]
+        cond_df = pd.DataFrame({"Strategy Rules": conditions})
+        cols = ['Stock', 'Trade_Type', 'Entry_Date_Time', 'Entry_Price', 'Qty', 
+                'Initial_SL', 'Target_Price', 'Exit_Date_Time', 'Exit_Price', 
+                'Exit_Reason', 'Bars_In_Trade', 'PnL']
+        trade_df = pd.DataFrame(columns=cols)
         
-        return {
-            "timestamp": str(latest_time),
-            "symbol": symbol,
-            "direction": "BUY CALL (BULLISH)" if signal == 1 else "BUY PUT (BEARISH)",
-            "underlying_entry": latest_bar['Entry'],
-            "stop_loss": latest_bar['SL'],
-            "target": latest_bar['TP'],
-            "risk_pts": round(abs(latest_bar['Entry'] - latest_bar['SL']), 2),
-            "reward_pts": round(abs(latest_bar['TP'] - latest_bar['Entry']), 2),
-            "rr_ratio": "1:2.0+",
-            "recommended_option": f"{symbol} {atm_strike} {opt_type} ({near_expiry})"
-        }
+        with pd.ExcelWriter(TRADE_LOG_FILE, engine='openpyxl') as writer:
+            trade_df.to_excel(writer, sheet_name='Trade_Log', index=False)
+            cond_df.to_excel(writer, sheet_name='Conditions', index=False)
+
+def log_trade_to_excel(trade_dict):
+    """Appends closed trades to the Excel Debugger."""
+    df = pd.DataFrame([trade_dict])
+    with pd.ExcelWriter(TRADE_LOG_FILE, engine='openpyxl', mode='a', if_sheet_exists='overlay') as writer:
+        startrow = writer.sheets['Trade_Log'].max_row
+        df.to_excel(writer, sheet_name='Trade_Log', startrow=startrow, index=False, header=False)
+
+def process_symbol(symbol, token, config, email_creds):
+    now = datetime.now(IST)
+    current_time = now.time()
+    active_trade = OPEN_TRADES[symbol]
     
-    return {
-        "timestamp": str(latest_time),
-        "symbol": symbol,
-        "status": "NO MATCHING SETUP",
-        "last_price": latest_bar['close']
-    }
+    # 1. Resolve Instrument
+    expiries = get_all_expiries(symbol, token, logger=lambda x: None)
+    if not expiries: return
+    fut_key = resolve_exact_contract(symbol, expiries[0], token, inst_type="FUTIDX", logger=lambda x: None)
+    if not fut_key: return
+
+    # 2. Fetch Unified Data (1-minute timeframe for resampling)
+    start_str = (now - timedelta(days=5)).strftime('%Y-%m-%d')
+    today_str = now.strftime('%Y-%m-%d')
+    df_1m = fetch_candle_chunk(fut_key, start_str, today_str, token, interval='1minute', logger=lambda x: None)
+    
+    if df_1m.empty: return
+    current_close = df_1m.iloc[-1]['close']
+
+    # ==========================================
+    # TRADE MANAGEMENT (EXIT LOGIC)
+    # ==========================================
+    if active_trade is not None:
+        exit_price, exit_reason = None, None
+        
+        if current_time >= datetime.time(15, 15):
+            exit_price = current_close
+            exit_reason = '15:15 Auto Square Off'
+        elif active_trade['type'] == 'BUY CE':
+            if current_close <= active_trade['sl_price']:
+                exit_price = active_trade['sl_price']
+                exit_reason = 'SL Hit'
+            elif current_close >= active_trade['target_price']:
+                exit_price = active_trade['target_price']
+                exit_reason = 'Target Achieved'
+        elif active_trade['type'] == 'BUY PE':
+            if current_close >= active_trade['sl_price']:
+                exit_price = active_trade['sl_price']
+                exit_reason = 'SL Hit'
+            elif current_close <= active_trade['target_price']:
+                exit_price = active_trade['target_price']
+                exit_reason = 'Target Achieved'
+
+        if exit_price is not None:
+            # Calculate PnL & Log Trade
+            pnl = (exit_price - active_trade['entry_price']) * active_trade['qty'] if active_trade['type'] == 'BUY CE' else (active_trade['entry_price'] - exit_price) * active_trade['qty']
+            bars_held = int((now - active_trade['entry_time']).total_seconds() // 180)
+            
+            log_trade_to_excel({
+                'Stock': symbol, 'Trade_Type': active_trade['type'], 
+                'Entry_Date_Time': active_trade['entry_time'].strftime("%Y-%m-%d %H:%M:%S"), 
+                'Entry_Price': active_trade['entry_price'], 'Qty': active_trade['qty'], 
+                'Initial_SL': active_trade['sl_price'], 'Target_Price': active_trade['target_price'],
+                'Exit_Date_Time': now.strftime("%Y-%m-%d %H:%M:%S"), 'Exit_Price': exit_price, 
+                'Exit_Reason': exit_reason, 'Bars_In_Trade': bars_held, 'PnL': round(pnl, 2)
+            })
+            
+            print(f"💰 TRADE CLOSED | {symbol} {exit_reason} | PnL: Rs {round(pnl, 2)}")
+            if email_creds['user'] and email_creds['pass']:
+                body = f"Trade Closed: {symbol} {active_trade['type']}\nReason: {exit_reason}\nEntry: {active_trade['entry_price']}\nExit: {exit_price}\nPnL: Rs {round(pnl, 2)}"
+                send_email_alert(f"TRADE EXIT: {symbol} ({exit_reason})", body, email_creds['user'], email_creds['pass'], email_creds['user'])
+            
+            OPEN_TRADES[symbol] = None
+        else:
+            mtm = (current_close - active_trade['entry_price']) * active_trade['qty'] if active_trade['type'] == 'BUY CE' else (active_trade['entry_price'] - current_close) * active_trade['qty']
+            print(f"⚡ ACTIVE TRADE | {symbol} {active_trade['type']} | CMP: {current_close} | MTM: Rs {round(mtm, 2)}")
+        return
+
+    # ==========================================
+    # SCANNER LOGIC (ENTRY)
+    # ==========================================
+    if current_time >= datetime.time(14, 0):
+        print(f"🛑 [{symbol}] Post 14:00 IST. Scanning disabled for new entries.")
+        return 
+
+    # Only evaluate on strict 3-minute boundaries to mirror Debugger exactly
+    if now.minute % 3 == 0:
+        signal_data = generate_v2_signals(df_1m, target_pts=config['target_pts'], sl_pts=config['sl_pts'])
+        
+        if signal_data:
+            print(f"🔥 LIVE SIGNAL DETECTED: {symbol} {signal_data['direction']} 🔥")
+            trade = {
+                'type': signal_data['direction'], 
+                'entry_time': now, 
+                'entry_price': signal_data['entry_price'],
+                'qty': config['default_lot'], 
+                'sl_price': signal_data['sl_price'], 
+                'target_price': signal_data['target_price']
+            }
+            OPEN_TRADES[symbol] = trade
+            
+            if email_creds['user'] and email_creds['pass']:
+                body = f"New Trade Executed: {symbol} {trade['type']}\nEntry: {trade['entry_price']}\nTarget: {trade['target_price']}\nSL: {trade['sl_price']}"
+                send_email_alert(f"TRADE ENTRY: {symbol} {trade['type']}", body, email_creds['user'], email_creds['pass'], email_creds['user'])
+        else:
+            print(f"🟢 [{symbol}] Monitoring 3m Boundary... No setup.")
+    else:
+        print(f"🟢 [{symbol}] Waiting for next 3-minute candle close. CMP: {current_close}")
 
 def run_live_scanner_loop():
-    """Runs continuously in the background, sending emails when a setup hits during market hours."""
     config_file = os.path.join(BASE_DIR, "scanner_config.json")
     if not os.path.exists(config_file):
         print("❌ Error: scanner_config.json not found.")
@@ -116,70 +166,34 @@ def run_live_scanner_loop():
 
     token = config.get("upstox_token")
     symbols = config.get("symbols", ["NIFTY", "SENSEX"])
-    gmail_user = config.get("gmail_user")
-    gmail_pass = config.get("gmail_pass")
+    email_creds = {"user": config.get("gmail_user"), "pass": config.get("gmail_pass")}
     
-    # State tracker to prevent duplicate emails for the same candle signal
-    last_alert_time = {sym: None for sym in symbols}
-
+    initialize_excel_log()
     print("=" * 60)
-    print(f"🚀 LIVE BACKGROUND SCANNER ACTIVE [{datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')}]")
+    print(f"🚀 V2 VWAP+EMA SCANNER DETACHED & ACTIVE [{datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')}]")
+    print(f"📊 Daily Validation Debugger: {TRADE_LOG_FILE}")
     print("=" * 60)
 
     try:
         while True:
             current_time = datetime.now(IST)
-            
-            # --- MARKET HOURS CHECK ---
-            is_weekday = current_time.weekday() <= 4 # 0=Mon, 4=Fri
+            is_weekday = current_time.weekday() <= 4 
             market_start = current_time.replace(hour=9, minute=15, second=0, microsecond=0)
             market_end = current_time.replace(hour=15, minute=30, second=0, microsecond=0)
             
             if not is_weekday or current_time < market_start or current_time > market_end:
                 print(f"😴 Market Closed. Scanner resting... ({current_time.strftime('%H:%M:%S')} IST)")
-                time.sleep(300) # Sleep for 5 minutes and check again
+                time.sleep(300) 
                 continue
-            # --------------------------
 
             print(f"\n⏰ Scan Cycle: {current_time.strftime('%H:%M:%S')} IST")
-
             for symbol in symbols:
-                res = scan_symbol(symbol, token)
-                if res and "direction" in res:
-                    signal_time = res["timestamp"]
-                    
-                    # Only alert if this is a brand new signal timestamp
-                    if signal_time != last_alert_time[symbol]:
-                        last_alert_time[symbol] = signal_time
-                        
-                        print(f"🔥 NEW {symbol} SIGNAL DETECTED! Processing Alert...")
-                        
-                        subject = f"🚨 {symbol} ALERT: {res['direction']} @ {res['underlying_entry']}"
-                        body = (
-                            f"Live Quant Alert Triggered\n"
-                            f"--------------------------\n"
-                            f"Instrument : {res['symbol']}\n"
-                            f"Action     : {res['direction']}\n"
-                            f"Entry Px   : {res['underlying_entry']}\n"
-                            f"Stop Loss  : {res['stop_loss']} (-{res['risk_pts']} pts)\n"
-                            f"Target     : {res['target']} (+{res['reward_pts']} pts)\n\n"
-                            f"Recommended Strike:\n{res['recommended_option']}\n\n"
-                            f"Signal Time: {signal_time} IST"
-                        )
-                        
-                        if gmail_user and gmail_pass:
-                            send_email_alert(subject, body, gmail_user, gmail_pass, gmail_user)
-                        else:
-                            print("⚠️ Email skipped: Gmail credentials missing in Streamlit Secrets.")
-                            
-                    else:
-                        print(f"  🟢 [{symbol}] Signal active, but alert already sent for this candle.")
-                else:
-                    last_px = res.get('last_price', 'N/A') if res else 'N/A'
-                    print(f"  🟢 [{symbol}] Monitoring... Last Price: {last_px}")
-
-            # Sleep for 5 minutes between checks to align with the 5-min candle chart
-            time.sleep(300)
+                if symbol in INSTRUMENT_CONFIG:
+                    process_symbol(symbol, token, INSTRUMENT_CONFIG[symbol], email_creds)
+            
+            # Wake up every 60 seconds to check for active trade targets/stops, 
+            # but new signals only evaluate on the 3rd minute natively.
+            time.sleep(60)
 
     except KeyboardInterrupt:
         print("\n🛑 Scanner stopped.")
