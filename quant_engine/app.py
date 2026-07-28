@@ -135,6 +135,6 @@ with tab2:
         
     if st.button("🛠️ Run Debug Post-Mortem for Today"):
         with st.spinner("Generating debug report..."):
-        result = subprocess.run([sys.executable, "debug_today_signals.py"], capture_output=True, text=True, cwd=BASE_DIR)
+             result = subprocess.run([sys.executable, "debug_today_signals.py"], capture_output=True, text=True, cwd=BASE_DIR)
         st.code(result.stdout, language="text")
 
