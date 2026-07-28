@@ -1,0 +1,125 @@
+import os
+import sys
+import json
+import pandas as pd
+from datetime import datetime, timedelta
+
+# Point to the quant_engine directory
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+from core.config import IST
+from data.instrument_master import get_all_expiries, resolve_exact_contract
+from data.candle_fetcher import fetch_candle_chunk
+from live_scanner import calculate_indicators_and_rr
+
+def debug_todays_signals(symbol, token):
+    print(f"\n{'='*70}")
+    print(f"🛠️ DEBUGGING TODAY'S SIGNALS: {symbol}")
+    print(f"{'='*70}")
+
+    today_str = datetime.now(IST).strftime('%Y-%m-%d')
+    # Fetch a few days back to ensure the 50 EMA has enough data to calculate accurately
+    start_str = (datetime.now(IST) - timedelta(days=5)).strftime('%Y-%m-%d')
+
+    all_expiries = get_all_expiries(symbol, token, logger=lambda x: None)
+    if not all_expiries:
+        print(f"❌ Failed to get expiries for {symbol}")
+        return
+
+    near_expiry = all_expiries[0]
+    future_key = resolve_exact_contract(symbol, near_expiry, token, inst_type="FUTIDX", logger=lambda x: None)
+
+    if not future_key:
+        print(f"❌ Failed to resolve active contract for {symbol}")
+        return
+
+    print(f"📥 Fetching 5-min candles for {future_key}...")
+    df = fetch_candle_chunk(future_key, start_str, today_str, token, interval='5minute', logger=lambda x: None)
+
+    if df.empty:
+        print("❌ No data fetched from Upstox.")
+        return
+
+    # Calculate indicators using your exact scanner math
+    df = calculate_indicators_and_rr(df, rr_ratio=2.0)
+
+    # Filter the dataframe to only show today's candles
+    today_date_str = datetime.now(IST).strftime('%Y-%m-%d')
+    df_today = df.loc[today_date_str:]
+
+    if df_today.empty:
+        print("⚠️ No candles found for today yet. Market might not be open.")
+        return
+
+    print(f"🔍 Found {len(df_today)} candles for today. Scanning conditions...\n")
+
+    crossovers_found = 0
+
+    for idx in df_today.index:
+        i = df.index.get_loc(idx)
+        if i == 0: continue # Skip the very first row to avoid bounds errors
+        
+        curr_time = df.index[i].strftime('%H:%M')
+        price = round(df['close'].iloc[i], 2)
+        ema = round(df['EMA_50'].iloc[i], 2)
+        
+        prev_k = round(df['STOCH_K'].iloc[i-1], 2)
+        prev_d = round(df['STOCH_D'].iloc[i-1], 2)
+        curr_k = round(df['STOCH_K'].iloc[i], 2)
+        curr_d = round(df['STOCH_D'].iloc[i], 2)
+        
+        signal = df['Signal'].iloc[i]
+
+        # --- Boolean Condition Checks ---
+        cond_long_ema = price > ema
+        cond_long_cross = (prev_k < prev_d) and (curr_k > curr_d)
+        cond_long_os = prev_k <= 30
+
+        cond_short_ema = price < ema
+        cond_short_cross = (prev_k > prev_d) and (curr_k < curr_d)
+        cond_short_ob = prev_k >= 70
+
+        # Only print logs when a Stoch Crossover actually happens (to keep the log clean)
+        if cond_long_cross or cond_short_cross:
+            crossovers_found += 1
+            
+            if signal == 1:
+                print(f"🟩 [TIME: {curr_time}] PRICE: {price} | 50-EMA: {ema} | STOCH: ({prev_k} -> {curr_k})")
+                print(f"   ┣━▶ LONG CONDITIONS  : Price>EMA: {cond_long_ema} | CrossUp: {cond_long_cross} | Oversold(<=30): {cond_long_os}")
+                print(f"   ┗━▶ RESULT           : ✅ SIGNAL FIRED (Valid Long Setup)\n")
+                
+            elif signal == -1:
+                print(f"🟥 [TIME: {curr_time}] PRICE: {price} | 50-EMA: {ema} | STOCH: ({prev_k} -> {curr_k})")
+                print(f"   ┣━▶ SHORT CONDITIONS : Price<EMA: {cond_short_ema} | CrossDn: {cond_short_cross} | Overbought(>=70): {cond_short_ob}")
+                print(f"   ┗━▶ RESULT           : ✅ SIGNAL FIRED (Valid Short Setup)\n")
+                
+            else:
+                print(f"⬜ [TIME: {curr_time}] PRICE: {price} | 50-EMA: {ema} | STOCH: ({prev_k} -> {curr_k})")
+                if cond_long_cross:
+                    print(f"   ┣━▶ CROSS UP DETECTED: Price>EMA: {cond_long_ema} | Oversold(<=30): {cond_long_os}")
+                    print(f"   ┗━▶ RESULT           : ❌ FILTERED OUT (Did not meet all Long criteria)\n")
+                if cond_short_cross:
+                    print(f"   ┣━▶ CROSS DN DETECTED: Price<EMA: {cond_short_ema} | Overbought(>=70): {cond_short_ob}")
+                    print(f"   ┗━▶ RESULT           : ❌ FILTERED OUT (Did not meet all Short criteria)\n")
+
+    if crossovers_found == 0:
+        print("📭 No Stochastic crossovers occurred today at all.")
+
+if __name__ == "__main__":
+    # Pull the token directly from your existing config file
+    config_path = os.path.join(BASE_DIR, "scanner_config.json")
+    
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            cfg = json.load(f)
+            upstox_token = cfg.get("upstox_token")
+            
+            if upstox_token:
+                debug_todays_signals("NIFTY", upstox_token)
+                debug_todays_signals("SENSEX", upstox_token)
+            else:
+                print("❌ Upstox token missing in scanner_config.json. Please start the scanner from the UI first to save credentials.")
+    else:
+        print("❌ scanner_config.json not found. Please start the scanner from the Streamlit UI first.")
