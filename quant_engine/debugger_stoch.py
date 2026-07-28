@@ -13,31 +13,10 @@ if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
 from core.config import IST
-
-def get_front_month_future(symbol_prefix):
-    """Robustly fetches the active front-month future contract key."""
-    url = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
-    try:
-        df = pd.read_csv(url)
-        df.columns = df.columns.str.strip().str.lower()
-        
-        # FIX: Upstox internal name for SENSEX is BSESENSEX
-        search_name = "BSESENSEX" if symbol_prefix == "SENSEX" else symbol_prefix
-        
-        df_f = df[(df['instrument_type'] == 'FUTIDX') & (df['name'] == search_name)]
-        if df_f.empty: return None
-        
-        df_f['expiry'] = pd.to_datetime(df_f['expiry']).dt.date
-        today = datetime.now(IST).date()
-        active_contracts = df_f[df_f['expiry'] >= today].sort_values('expiry')
-        if not active_contracts.empty:
-            return active_contracts.iloc[0]['instrument_key']
-    except Exception:
-        pass
-    return None
+from data.instrument_master import get_all_expiries, resolve_exact_contract
 
 def fetch_unified_data(instrument_key, token, days=5):
-    """Fetches strictly 1-minute data (which Upstox API allows)."""
+    """Fetches strictly 1-minute data and stitches historical + intraday."""
     encoded_key = urllib.parse.quote(instrument_key)
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
     
@@ -46,12 +25,10 @@ def fetch_unified_data(instrument_key, token, days=5):
     to_str = now.strftime('%Y-%m-%d')
     from_str = start_date.strftime('%Y-%m-%d')
     
-    # Historical Fetch (1-minute)
     hist_url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/1minute/{to_str}/{from_str}"
     hist_res = requests.get(hist_url, headers=headers)
     hist_data = hist_res.json().get('data', {}).get('candles', []) if hist_res.status_code == 200 else []
     
-    # Intraday Fetch (1-minute)
     intra_url = f"https://api.upstox.com/v2/historical-candle/intraday/{encoded_key}/1minute"
     intra_res = requests.get(intra_url, headers=headers)
     intra_data = intra_res.json().get('data', {}).get('candles', []) if intra_res.status_code == 200 else []
@@ -67,7 +44,6 @@ def fetch_unified_data(instrument_key, token, days=5):
     return pd.DataFrame()
 
 def resample_candles(df, timeframe):
-    """Resamples 1-minute data into any requested timeframe."""
     if df.empty: return df
     agg_dict = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
     df_resampled = df.resample(timeframe).agg(agg_dict)
@@ -102,12 +78,18 @@ def run_stoch_debugger(symbol="NIFTY"):
 
     print(f"🔄 Fetching data for {symbol}...")
     
-    future_key = get_front_month_future(symbol)
-    if not future_key:
-        print("❌ Failed to resolve front-month futures contract.")
+    # --- USE CORE INSTRUMENT MASTER TO RESOLVE CONTRACT ---
+    all_expiries = get_all_expiries(symbol, token, logger=lambda x: None)
+    if not all_expiries: 
+        print(f"❌ Failed to fetch expiries for {symbol}.")
         return
+        
+    future_key = resolve_exact_contract(symbol, all_expiries[0], token, inst_type="FUTIDX", logger=lambda x: None)
+    if not future_key:
+        print(f"❌ Failed to resolve front-month futures contract for {symbol}.")
+        return
+    # ------------------------------------------------------
 
-    # FIX: Fetch 1-minute data and resample it to 5-minute to avoid API blocks
     df_1m = fetch_unified_data(future_key, token, days=5)
     if df_1m.empty:
         print("❌ No data returned from API.")
@@ -135,7 +117,6 @@ def run_stoch_debugger(symbol="NIFTY"):
         prev_idx = day_df.index[i-1]
         time_obj = curr_idx.time()
         
-        # Only evaluate during market hours
         if not (dtime(9, 15) <= time_obj <= dtime(15, 30)):
             continue
         
