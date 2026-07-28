@@ -3,6 +3,8 @@ import sys
 import json
 import pandas as pd
 import pandas_ta as ta
+import requests
+import urllib.parse
 from datetime import datetime, timedelta
 
 # Ensure quant_engine directory is in Python path
@@ -11,72 +13,95 @@ if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
 from core.config import IST
-from data.instrument_master import get_all_expiries, resolve_exact_contract
-from data.candle_fetcher import fetch_candle_chunk
+
+def get_front_month_future(symbol_prefix):
+    """Robustly fetches the active front-month future contract key."""
+    url = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
+    try:
+        df = pd.read_csv(url)
+        df.columns = df.columns.str.strip().str.lower()
+        ex_col = 'exchange' if 'exchange' in df.columns else 'segment'
+        df_f = df[(df[ex_col] == 'NSE_FO') & (df['instrument_type'] == 'FUTIDX') & (df['name'] == symbol_prefix)]
+        if df_f.empty: return None
+        df_f['expiry'] = pd.to_datetime(df_f['expiry']).dt.date
+        today = datetime.now(IST).date()
+        active_contracts = df_f[df_f['expiry'] >= today].sort_values('expiry')
+        if not active_contracts.empty:
+            return active_contracts.iloc[0]['instrument_key']
+    except Exception:
+        pass
+    return None
+
+def fetch_unified_data(instrument_key, token, days=5):
+    """Fetches both historical and intraday data and stitches them."""
+    encoded_key = urllib.parse.quote(instrument_key)
+    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
+    
+    now = datetime.now(IST)
+    start_date = now - timedelta(days=days)
+    to_str = now.strftime('%Y-%m-%d')
+    from_str = start_date.strftime('%Y-%m-%d')
+    
+    # Historical Fetch
+    hist_url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/5minute/{to_str}/{from_str}"
+    hist_res = requests.get(hist_url, headers=headers)
+    hist_data = hist_res.json().get('data', {}).get('candles', []) if hist_res.status_code == 200 else []
+    
+    # Intraday Fetch
+    intra_url = f"https://api.upstox.com/v2/historical-candle/intraday/{encoded_key}/5minute"
+    intra_res = requests.get(intra_url, headers=headers)
+    intra_data = intra_res.json().get('data', {}).get('candles', []) if intra_res.status_code == 200 else []
+    
+    all_data = hist_data + intra_data
+    
+    if all_data:
+        df = pd.DataFrame(all_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
+        df['timestamp'] = pd.to_datetime(df['timestamp']).dt.tz_localize(None)
+        df = df.sort_values('timestamp').drop_duplicates('timestamp').set_index('timestamp')
+        df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
+        return df
+    return pd.DataFrame()
 
 def calculate_stoch_indicators(df, ltf_k=14, ltf_d=3, htf_ema=50):
-    """Calculates the indicators required for the Stochastic Strategy."""
     df = df.copy()
     df['EMA_50'] = ta.ema(df['close'], length=htf_ema)
-    
     stoch = ta.stoch(df['high'], df['low'], df['close'], k=ltf_k, d=ltf_d)
+    
     if stoch is not None and not stoch.empty:
         df['STOCH_K'] = stoch[f'STOCHk_{ltf_k}_{ltf_d}_3']
         df['STOCH_D'] = stoch[f'STOCHd_{ltf_k}_{ltf_d}_3']
     else:
-        df['STOCH_K'] = 50.0
-        df['STOCH_D'] = 50.0
+        df['STOCH_K'], df['STOCH_D'] = 50.0, 50.0
         
     return df.dropna()
 
 def run_stoch_debugger(symbol="NIFTY"):
-    """Fetches recent data, isolates the latest trading day, and validates conditions."""
     config_file = os.path.join(BASE_DIR, "scanner_config.json")
     if not os.path.exists(config_file):
-        print("❌ Error: scanner_config.json not found. Please run the scanner from the UI first to save credentials.")
+        print("❌ Error: scanner_config.json not found. Run the scanner from the UI first.")
         return
 
     with open(config_file, "r") as f:
         config = json.load(f)
     token = config.get("upstox_token")
+    
     if not token:
         print("❌ Error: Upstox token missing in config.")
         return
 
     print(f"🔄 Fetching data for {symbol}...")
     
-    # 1. Resolve Contract
-    all_expiries = get_all_expiries(symbol, token, logger=lambda x: None)
-    if not all_expiries: 
-        print("❌ Failed to fetch expiries.")
-        return
-        
-    future_key = resolve_exact_contract(symbol, all_expiries[0], token, inst_type="FUTIDX", logger=lambda x: None)
+    future_key = get_front_month_future(symbol)
     if not future_key:
-        print("❌ Failed to resolve futures contract.")
+        print("❌ Failed to resolve front-month futures contract.")
         return
 
-    # 2. Fetch Data (Look back 5 days to ensure we have enough data for EMA/Stoch warmup)
-    today = datetime.now(IST)
-    start_date = today - timedelta(days=5)
-    
-    df = fetch_candle_chunk(
-        future_key, 
-        start_date.strftime('%Y-%m-%d'), 
-        today.strftime('%Y-%m-%d'), 
-        token, 
-        interval='5minute', 
-        logger=lambda x: None
-    )
-    
+    df = fetch_unified_data(future_key, token, days=5)
     if df.empty:
-        print("❌ No data returned from API.")
+        print("❌ No data returned from API. Token might be expired.")
         return
 
-    # 3. Calculate Indicators
     df = calculate_stoch_indicators(df)
-    
-    # 4. Isolate the Latest Trading Day
     df['date'] = df.index.date
     latest_date = df['date'].max()
     day_df = df[df['date'] == latest_date].copy()
@@ -85,7 +110,6 @@ def run_stoch_debugger(symbol="NIFTY"):
         print("❌ Not enough data to process the latest trading day.")
         return
 
-    # 5. Print the Debugger Table
     print("\n" + "=" * 115)
     print(f"📊 [STOCHASTIC] DAILY VALIDATION DEBUGGER | {symbol} | Date: {latest_date}")
     print("=" * 115)
@@ -93,8 +117,6 @@ def run_stoch_debugger(symbol="NIFTY"):
     print("-" * 115)
 
     for i in range(1, len(day_df)):
-        # Getting the previous and current values natively from the daily slice 
-        # (using index positioning from the full df to get the true previous candle)
         curr_idx = day_df.index[i]
         prev_idx = day_df.index[i-1]
         
@@ -102,43 +124,31 @@ def run_stoch_debugger(symbol="NIFTY"):
         prev_row = day_df.loc[prev_idx]
 
         time_str = curr_idx.strftime('%H:%M')
-        close = curr_row['close']
-        ema = curr_row['EMA_50']
-        
+        close, ema = curr_row['close'], curr_row['EMA_50']
         curr_k, curr_d = curr_row['STOCH_K'], curr_row['STOCH_D']
         prev_k, prev_d = prev_row['STOCH_K'], prev_row['STOCH_D']
 
-        # --- Evaluate Conditions ---
-        
-        # 1. Trend Filter
         trend_up = close > ema
         trend_dn = close < ema
         trend_str = "✅ UP" if trend_up else "✅ DN" if trend_dn else "❌ --"
 
-        # 2. Stochastic Crossover
         cross_up = (prev_k < prev_d) and (curr_k > curr_d)
         cross_dn = (prev_k > prev_d) and (curr_k < curr_d)
         cross_str = "✅ UP" if cross_up else "✅ DN" if cross_dn else "❌ --"
 
-        # 3. Overbought / Oversold Filter
         os_pass = prev_k <= 30
         ob_pass = prev_k >= 70
         ob_os_str = "✅ OS" if os_pass else "✅ OB" if ob_pass else "❌ MID"
 
-        # 4. Final Signal Check
         signal_str = "➖"
-        if trend_up and cross_up and os_pass:
-            signal_str = "🟢 LONG CE"
-        elif trend_dn and cross_dn and ob_pass:
-            signal_str = "🔴 SHORT PE"
+        if trend_up and cross_up and os_pass: signal_str = "🔥 LONG CE"
+        elif trend_dn and cross_dn and ob_pass: signal_str = "🔥 SHORT PE"
 
-        # --- Format Output ---
         print(f"{time_str:<8} | {close:<8.2f} | {ema:<8.2f} | {trend_str:<6} | {prev_k:<6.2f} | {prev_d:<6.2f} | {curr_k:<6.2f} | {curr_d:<6.2f} | {cross_str:<8} | {ob_os_str:<8} | {signal_str}")
 
     print("=" * 115)
     print("Debug run complete.\n")
 
 if __name__ == "__main__":
-    # Run for NIFTY by default, you can change this to SENSEX or run both
     run_stoch_debugger("NIFTY")
     run_stoch_debugger("SENSEX")
