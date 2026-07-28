@@ -134,7 +134,7 @@ with tab2:
         st.code(log_content[-2000:] if len(log_content) > 2000 else log_content, language="text")
         
     if st.button("🛠️ Run Debug Post-Mortem for Today"):
-    with st.spinner("Generating debug report..."):
+        with st.spinner("Generating debug report..."):
         result = subprocess.run([sys.executable, "debug_today_signals.py"], capture_output=True, text=True, cwd=BASE_DIR)
         st.code(result.stdout, language="text")
 
