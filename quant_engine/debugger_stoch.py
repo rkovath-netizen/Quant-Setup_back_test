@@ -34,9 +34,27 @@ def get_front_month_future(symbol_prefix):
     return None
 
 def resample_candles(df, timeframe):
+    """Bulletproof resampling that handles capitalization and missing volume columns."""
     if df.empty: return df
+    
+    # 1. Force all column names to lowercase to fix the KeyError
+    df.columns = df.columns.str.lower()
+    
+    # 2. Safety fallback if the fetcher dropped the volume column entirely
+    if 'volume' not in df.columns:
+        df['volume'] = 0
+        
+    # 3. Ensure the index is a proper DateTime index
+    if not isinstance(df.index, pd.DatetimeIndex):
+        time_cols = [c for c in df.columns if c in ['timestamp', 'date', 'datetime']]
+        if time_cols:
+            df.set_index(time_cols[0], inplace=True)
+        df.index = pd.to_datetime(df.index)
+        
+    # 4. Perform the resample
     agg_dict = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
     df_resampled = df.resample(timeframe).agg(agg_dict)
+    
     return df_resampled.dropna(subset=['close'])
 
 def calculate_stoch_indicators(df, ltf_k=14, ltf_d=3, htf_ema=50):
@@ -78,7 +96,7 @@ def run_stoch_debugger(symbol="NIFTY"):
     start_str = (now - timedelta(days=5)).strftime('%Y-%m-%d')
     today_str = now.strftime('%Y-%m-%d')
 
-    # Hooking directly into your proven candle fetcher with live logging ON
+    # Hooking directly into your proven candle fetcher
     df_1m = fetch_candle_chunk(future_key, start_str, today_str, token, interval='1minute', logger=print)
     
     if df_1m.empty:
