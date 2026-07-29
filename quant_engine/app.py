@@ -11,7 +11,7 @@ if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
 st.set_page_config(page_title="Quant Dashboard", page_icon="📈", layout="centered")
-st.title("📈 Quant Master Dashboard")
+st.title("📈 Ramkumar Kovath - Quant Dashboard")
 st.caption("Multi-Strategy Background Engines & Daily Validation")
 
 # --- Process Trackers ---
@@ -68,10 +68,17 @@ with st.sidebar:
     
     selected_symbols = st.multiselect("Instruments", ["NIFTY", "SENSEX"], ["NIFTY", "SENSEX"])
 
-    # Always keep config updated for whichever scanner or debugger starts
+    # ADDED GITHUB SECRETS TO CONFIG SO SCANNERS CAN PUSH CSV LOGS
     if secrets_found:
         with open(CONFIG_FILE, "w") as f:
-            json.dump({"upstox_token": upstox_secret, "gmail_user": gmail_user, "gmail_pass": gmail_pass, "symbols": selected_symbols}, f)
+            json.dump({
+                "upstox_token": upstox_secret, 
+                "gmail_user": gmail_user, 
+                "gmail_pass": gmail_pass, 
+                "github_token": github_secret,
+                "github_repo": github_repo,
+                "symbols": selected_symbols
+            }, f)
 
 pid_stoch = is_running(PID_STOCH)
 pid_vwap = is_running(PID_VWAP)
@@ -79,9 +86,6 @@ pid_vwap = is_running(PID_VWAP)
 # --- DASHBOARD TABS ---
 tab1, tab2, tab3 = st.tabs(["📊 Backtester", "📡 Live Multi-Scanner", "🔬 Daily Debuggers"])
 
-# ==========================================
-# TAB 1: BACKTESTER
-# ==========================================
 with tab1:
     st.subheader("🚀 Backtest Execution")
     days = st.slider("Backtest Window (Days)", min_value=5, max_value=90, value=30, step=5)
@@ -106,14 +110,10 @@ with tab1:
             text = f.read()
         st.code(text[-2000:] if len(text) > 2000 else text, language="text")
 
-# ==========================================
-# TAB 2: LIVE SCANNERS
-# ==========================================
 with tab2:
     st.subheader("📡 Multi-Strategy Alert Engine")
     if st.button("🔄 Refresh All Scanner Logs"): st.rerun()
     
-    # ---- STOCHASTIC SCANNER ----
     st.markdown("### 1️⃣ Stochastic Momentum (1:2 RR)")
     if pid_stoch:
         st.success(f"✅ Running (PID: {pid_stoch})")
@@ -131,7 +131,6 @@ with tab2:
 
     st.divider()
 
-    # ---- VWAP V2 SCANNER ----
     st.markdown("### 2️⃣ VWAP + EMA V2")
     if pid_vwap:
         st.success(f"✅ Running (PID: {pid_vwap})")
@@ -147,9 +146,6 @@ with tab2:
         with open(LOG_VWAP, "r") as f: text = f.read()
         st.code(text[-1500:] if len(text)>1500 else text, language="text")
 
-# ==========================================
-# TAB 3: DAILY DEBUGGERS
-# ==========================================
 with tab3:
     st.subheader("🔬 Daily Validation Debuggers")
     st.caption("Run end-of-day or mid-day validations to see exactly which conditions passed/failed.")
@@ -157,31 +153,22 @@ with tab3:
     if not secrets_found:
         st.error("⚠️ Streamlit Secrets are required to fetch live data for the debuggers.")
     else:
-        # --- STOCHASTIC DEBUGGER ---
         if st.button("▶️ Run Stochastic Debugger", type="primary", use_container_width=True):
             with st.spinner("Fetching data and generating Stochastic validation table..."):
                 if not os.path.exists(os.path.join(BASE_DIR, "debugger_stoch.py")):
-                    st.error("⚠️ 'debugger_stoch.py' not found in quant_engine folder.")
+                    st.error("⚠️ 'debugger_stoch.py' not found.")
                 else:
                     result = subprocess.run([sys.executable, "debugger_stoch.py"], capture_output=True, text=True, cwd=BASE_DIR)
-                    if result.stdout:
-                        st.code(result.stdout, language="text")
-                    if result.stderr:
-                        st.error(result.stderr)
+                    if result.stdout: st.code(result.stdout, language="text")
+                    if result.stderr: st.error(result.stderr)
         
         st.divider()
 
-        # --- EMA / VWAP DEBUGGER ---
         if st.button("▶️ Run VWAP + EMA Debugger", type="primary", use_container_width=True):
             with st.spinner("Fetching data and generating VWAP+EMA validation table..."):
-                # Dynamically check for either naming convention you might have used
-                script_name = "debugger_ema.py" if os.path.exists(os.path.join(BASE_DIR, "debugger_ema.py")) else "debugger_vwap.py"
-                
-                if not os.path.exists(os.path.join(BASE_DIR, script_name)):
-                    st.warning(f"⚠️ Could not find '{script_name}'. Please ensure your EMA debugger script is uploaded to the quant_engine folder.")
+                if not os.path.exists(os.path.join(BASE_DIR, "debugger_vwap.py")):
+                    st.warning("⚠️ Could not find 'debugger_vwap.py'.")
                 else:
-                    result = subprocess.run([sys.executable, script_name], capture_output=True, text=True, cwd=BASE_DIR)
-                    if result.stdout:
-                        st.code(result.stdout, language="text")
-                    if result.stderr:
-                        st.error(result.stderr)
+                    result = subprocess.run([sys.executable, "debugger_vwap.py"], capture_output=True, text=True, cwd=BASE_DIR)
+                    if result.stdout: st.code(result.stdout, language="text")
+                    if result.stderr: st.error(result.stderr)
