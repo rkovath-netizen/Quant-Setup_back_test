@@ -5,7 +5,7 @@ import json
 import base64
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path:
@@ -86,7 +86,8 @@ def process_symbol(symbol, token, config, email_creds, global_config):
     if active_trade is not None:
         exit_price, exit_reason = None, None
         
-        if current_time >= datetime.time(15, 15):
+        # FIX: Used dtime for 15:15
+        if current_time >= dtime(15, 15):
             exit_price, exit_reason = current_close, '15:15 Auto Square Off'
         elif active_trade['type'] == 'BUY CE':
             if current_close <= active_trade['sl_price']: exit_price, exit_reason = active_trade['sl_price'], 'SL Hit'
@@ -123,7 +124,8 @@ def process_symbol(symbol, token, config, email_creds, global_config):
         return
 
     # --- TRADE ENTRIES ---
-    if current_time >= datetime.time(14, 0):
+    # FIX: Used dtime for 14:00
+    if current_time >= dtime(14, 0):
         print(f"🛑 [{symbol}] Post 14:00 IST. Scanning disabled.")
         return 
 
