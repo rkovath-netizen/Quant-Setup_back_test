@@ -2,118 +2,115 @@ import os
 import sys
 import time
 import json
+import base64
+import requests
 import pandas as pd
 from datetime import datetime, timedelta
 
-# --- Ensure quant_engine directory is in Python path ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
 from core.config import IST
-from data.instrument_master import get_all_expiries, resolve_exact_contract
 from data.candle_fetcher import fetch_candle_chunk
 from core.notifier import send_email_alert
 from strategies.vwap_ema_v2 import generate_v2_signals
 
-TIMESTAMP_STR = datetime.now(IST).strftime("%Y%m%d")
-TRADE_LOG_FILE = os.path.join(BASE_DIR, f"Live_Debugger_V2_{TIMESTAMP_STR}.xlsx")
-
 OPEN_TRADES = {"NIFTY": None, "SENSEX": None}
 INSTRUMENT_CONFIG = {
     "NIFTY": {"default_lot": 25, "target_pts": 25, "sl_pts": 15},
-    "SENSEX": {"default_lot": 10, "target_pts": 75, "sl_pts": 45} # Scaled for Sensex volatility
+    "SENSEX": {"default_lot": 10, "target_pts": 75, "sl_pts": 45} 
 }
 
-def initialize_excel_log():
-    """Initializes the Daily Excel Debugger for validation."""
-    if not os.path.exists(TRADE_LOG_FILE):
-        conditions = [
-            "STRATEGY ENTRY AND EXIT CONDITIONS (V2)",
-            "15-MINUTE BIAS",
-            "- BUY CE: 15m Close > 15m VWAP AND 15m 9 EMA > 15m 21 EMA",
-            "- BUY PE: 15m Close < 15m VWAP AND 15m 9 EMA < 15m 21 EMA",
-            "3-MINUTE ENTRY TRIGGER",
-            "- Pullback touching 9 EMA or VWAP + Vol Expansion + Rejection",
-            "RISK MANAGEMENT",
-            "- Target/SL predefined per instrument.",
-            "- No new entries >= 14:00 IST",
-            "- Auto Square-Off at 15:15 IST"
-        ]
-        cond_df = pd.DataFrame({"Strategy Rules": conditions})
-        cols = ['Stock', 'Trade_Type', 'Entry_Date_Time', 'Entry_Price', 'Qty', 
-                'Initial_SL', 'Target_Price', 'Exit_Date_Time', 'Exit_Price', 
-                'Exit_Reason', 'Bars_In_Trade', 'PnL']
-        trade_df = pd.DataFrame(columns=cols)
+def get_front_month_future(symbol_prefix):
+    url = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
+    try:
+        df = pd.read_csv(url)
+        df.columns = df.columns.str.strip().str.lower()
+        df_f = df[(df['instrument_type'] == 'FUTIDX') & (df['name'] == symbol_prefix)]
+        if df_f.empty: return None
+        df_f['expiry'] = pd.to_datetime(df_f['expiry']).dt.date
+        today = datetime.now(IST).date()
+        active = df_f[df_f['expiry'] >= today].sort_values('expiry')
+        if not active.empty: return active.iloc[0]['instrument_key']
+    except Exception: pass
+    return None
+
+def push_to_github(data_dict, strategy_name, gh_token, gh_repo):
+    if not gh_token or not gh_repo: return
+    try:
+        date_str = datetime.now(IST).strftime("%Y-%m-%d")
+        filename = f"Live_Signals_{strategy_name}_{date_str}.csv"
+        api_url = f"https://api.github.com/repos/{gh_repo}/contents/logs/{filename}"
+        headers = {"Authorization": f"token {gh_token}", "Accept": "application/vnd.github.v3+json"}
         
-        with pd.ExcelWriter(TRADE_LOG_FILE, engine='openpyxl') as writer:
-            trade_df.to_excel(writer, sheet_name='Trade_Log', index=False)
-            cond_df.to_excel(writer, sheet_name='Conditions', index=False)
+        res = requests.get(api_url, headers=headers)
+        new_row = ",".join([str(v) for v in data_dict.values()]) + "\n"
+        
+        if res.status_code == 200:
+            file_data = res.json()
+            sha = file_data['sha']
+            content = base64.b64decode(file_data['content']).decode('utf-8')
+            updated_content = content + new_row
+        else:
+            sha = None
+            headers_str = ",".join(data_dict.keys()) + "\n"
+            updated_content = headers_str + new_row
+            
+        payload = {
+            "message": f"Auto-log {strategy_name} signal",
+            "content": base64.b64encode(updated_content.encode('utf-8')).decode('utf-8')
+        }
+        if sha: payload["sha"] = sha
+        requests.put(api_url, headers=headers, json=payload)
+    except Exception as e:
+        print(f"⚠️ GitHub Push Failed: {e}")
 
-def log_trade_to_excel(trade_dict):
-    """Appends closed trades to the Excel Debugger."""
-    df = pd.DataFrame([trade_dict])
-    with pd.ExcelWriter(TRADE_LOG_FILE, engine='openpyxl', mode='a', if_sheet_exists='overlay') as writer:
-        startrow = writer.sheets['Trade_Log'].max_row
-        df.to_excel(writer, sheet_name='Trade_Log', startrow=startrow, index=False, header=False)
-
-def process_symbol(symbol, token, config, email_creds):
+def process_symbol(symbol, token, config, email_creds, global_config):
     now = datetime.now(IST)
     current_time = now.time()
     active_trade = OPEN_TRADES[symbol]
     
-    # 1. Resolve Instrument
-    expiries = get_all_expiries(symbol, token, logger=lambda x: None)
-    if not expiries: return
-    fut_key = resolve_exact_contract(symbol, expiries[0], token, inst_type="FUTIDX", logger=lambda x: None)
+    fut_key = get_front_month_future(symbol)
     if not fut_key: return
 
-    # 2. Fetch Unified Data (1-minute timeframe for resampling)
-    start_str = (now - timedelta(days=5)).strftime('%Y-%m-%d')
+    # INCREASED TO 10 DAYS FOR EMA 21 WARMUP
+    start_str = (now - timedelta(days=10)).strftime('%Y-%m-%d')
     today_str = now.strftime('%Y-%m-%d')
     df_1m = fetch_candle_chunk(fut_key, start_str, today_str, token, interval='1minute', logger=lambda x: None)
     
     if df_1m.empty: return
     current_close = df_1m.iloc[-1]['close']
 
-    # ==========================================
-    # TRADE MANAGEMENT (EXIT LOGIC)
-    # ==========================================
+    # --- TRADE EXITS ---
     if active_trade is not None:
         exit_price, exit_reason = None, None
         
         if current_time >= datetime.time(15, 15):
-            exit_price = current_close
-            exit_reason = '15:15 Auto Square Off'
+            exit_price, exit_reason = current_close, '15:15 Auto Square Off'
         elif active_trade['type'] == 'BUY CE':
-            if current_close <= active_trade['sl_price']:
-                exit_price = active_trade['sl_price']
-                exit_reason = 'SL Hit'
-            elif current_close >= active_trade['target_price']:
-                exit_price = active_trade['target_price']
-                exit_reason = 'Target Achieved'
+            if current_close <= active_trade['sl_price']: exit_price, exit_reason = active_trade['sl_price'], 'SL Hit'
+            elif current_close >= active_trade['target_price']: exit_price, exit_reason = active_trade['target_price'], 'Target Achieved'
         elif active_trade['type'] == 'BUY PE':
-            if current_close >= active_trade['sl_price']:
-                exit_price = active_trade['sl_price']
-                exit_reason = 'SL Hit'
-            elif current_close <= active_trade['target_price']:
-                exit_price = active_trade['target_price']
-                exit_reason = 'Target Achieved'
+            if current_close >= active_trade['sl_price']: exit_price, exit_reason = active_trade['sl_price'], 'SL Hit'
+            elif current_close <= active_trade['target_price']: exit_price, exit_reason = active_trade['target_price'], 'Target Achieved'
 
         if exit_price is not None:
-            # Calculate PnL & Log Trade
             pnl = (exit_price - active_trade['entry_price']) * active_trade['qty'] if active_trade['type'] == 'BUY CE' else (active_trade['entry_price'] - exit_price) * active_trade['qty']
-            bars_held = int((now - active_trade['entry_time']).total_seconds() // 180)
             
-            log_trade_to_excel({
-                'Stock': symbol, 'Trade_Type': active_trade['type'], 
-                'Entry_Date_Time': active_trade['entry_time'].strftime("%Y-%m-%d %H:%M:%S"), 
-                'Entry_Price': active_trade['entry_price'], 'Qty': active_trade['qty'], 
-                'Initial_SL': active_trade['sl_price'], 'Target_Price': active_trade['target_price'],
-                'Exit_Date_Time': now.strftime("%Y-%m-%d %H:%M:%S"), 'Exit_Price': exit_price, 
-                'Exit_Reason': exit_reason, 'Bars_In_Trade': bars_held, 'PnL': round(pnl, 2)
-            })
-            
+            # PUSH EXIT TO GITHUB
+            exit_payload = {
+                "Timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "Symbol": symbol,
+                "Strategy": "VWAP V2",
+                "Action": f"EXIT ({exit_reason})",
+                "Entry": active_trade['entry_price'],
+                "SL": exit_price, # Actual exit price recorded here
+                "Target": 0,
+                "Option": f"PnL: Rs {round(pnl, 2)}"
+            }
+            push_to_github(exit_payload, "VWAP", global_config.get("github_token"), global_config.get("github_repo"))
+
             print(f"💰 TRADE CLOSED | {symbol} {exit_reason} | PnL: Rs {round(pnl, 2)}")
             if email_creds['user'] and email_creds['pass']:
                 body = f"Trade Closed: {symbol} {active_trade['type']}\nReason: {exit_reason}\nEntry: {active_trade['entry_price']}\nExit: {exit_price}\nPnL: Rs {round(pnl, 2)}"
@@ -125,42 +122,52 @@ def process_symbol(symbol, token, config, email_creds):
             print(f"⚡ ACTIVE TRADE | {symbol} {active_trade['type']} | CMP: {current_close} | MTM: Rs {round(mtm, 2)}")
         return
 
-    # ==========================================
-    # SCANNER LOGIC (ENTRY)
-    # ==========================================
+    # --- TRADE ENTRIES ---
     if current_time >= datetime.time(14, 0):
-        print(f"🛑 [{symbol}] Post 14:00 IST. Scanning disabled for new entries.")
+        print(f"🛑 [{symbol}] Post 14:00 IST. Scanning disabled.")
         return 
 
-    # Only evaluate on strict 3-minute boundaries
     if now.minute % 3 == 0:
+        # Force column formatting before passing to generator
+        df_1m.columns = df_1m.columns.str.lower()
+        if 'volume' not in df_1m.columns: df_1m['volume'] = 1
+        df_1m['volume'] = df_1m['volume'].replace(0, 1)
+
         signal_data = generate_v2_signals(df_1m, target_pts=config['target_pts'], sl_pts=config['sl_pts'])
         
         if signal_data:
-            print(f"🔥 LIVE SIGNAL DETECTED: {symbol} {signal_data['direction']} 🔥")
             trade = {
-                'type': signal_data['direction'], 
-                'entry_time': now, 
-                'entry_price': signal_data['entry_price'],
-                'qty': config['default_lot'], 
-                'sl_price': signal_data['sl_price'], 
-                'target_price': signal_data['target_price']
+                'type': signal_data['direction'], 'entry_time': now, 
+                'entry_price': signal_data['entry_price'], 'qty': config['default_lot'], 
+                'sl_price': signal_data['sl_price'], 'target_price': signal_data['target_price']
             }
             OPEN_TRADES[symbol] = trade
             
+            # PUSH ENTRY TO GITHUB
+            entry_payload = {
+                "Timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "Symbol": symbol,
+                "Strategy": "VWAP V2",
+                "Action": trade['type'],
+                "Entry": trade['entry_price'],
+                "SL": trade['sl_price'],
+                "Target": trade['target_price'],
+                "Option": "-"
+            }
+            push_to_github(entry_payload, "VWAP", global_config.get("github_token"), global_config.get("github_repo"))
+
+            print(f"🔥 LIVE SIGNAL LOGGED: {symbol} {signal_data['direction']} 🔥")
             if email_creds['user'] and email_creds['pass']:
                 body = f"Strategy: VWAP + EMA V2\nNew Trade Executed: {symbol} {trade['type']}\nEntry: {trade['entry_price']}\nTarget: {trade['target_price']}\nSL: {trade['sl_price']}"
                 send_email_alert(f"🚨 [VWAP V2] TRADE ENTRY: {symbol} {trade['type']}", body, email_creds['user'], email_creds['pass'], email_creds['user'])
         else:
             print(f"🟢 [{symbol}] Monitoring 3m Boundary... No setup.")
     else:
-        print(f"🟢 [{symbol}] Waiting for next 3-minute candle close. CMP: {current_close}")
+        print(f"  ⏳ [{symbol}] Waiting for next 3-minute candle close. CMP: {current_close}")
 
 def run_live_scanner_loop():
     config_file = os.path.join(BASE_DIR, "scanner_config.json")
-    if not os.path.exists(config_file):
-        print("❌ Error: scanner_config.json not found.")
-        return
+    if not os.path.exists(config_file): return
 
     with open(config_file, "r") as f:
         config = json.load(f)
@@ -169,10 +176,8 @@ def run_live_scanner_loop():
     symbols = config.get("symbols", ["NIFTY", "SENSEX"])
     email_creds = {"user": config.get("gmail_user"), "pass": config.get("gmail_pass")}
     
-    initialize_excel_log()
     print("=" * 60)
-    print(f"🚀 [VWAP V2] SCANNER DETACHED & ACTIVE [{datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')}]")
-    print(f"📊 Daily Validation Debugger: {TRADE_LOG_FILE}")
+    print(f"🚀 [VWAP V2] SCANNER ACTIVE (GITHUB LOGGING ENABLED)")
     print("=" * 60)
 
     try:
@@ -183,16 +188,14 @@ def run_live_scanner_loop():
             market_end = current_time.replace(hour=15, minute=30, second=0, microsecond=0)
             
             if not is_weekday or current_time < market_start or current_time > market_end:
-                print(f"😴 [VWAP V2] Market Closed. Scanner resting... ({current_time.strftime('%H:%M:%S')} IST)")
+                print(f"😴 [VWAP V2] Market Closed.")
                 time.sleep(300) 
                 continue
 
-            print(f"\n⏰ [VWAP V2] Scan Cycle: {current_time.strftime('%H:%M:%S')} IST")
             for symbol in symbols:
                 if symbol in INSTRUMENT_CONFIG:
-                    process_symbol(symbol, token, INSTRUMENT_CONFIG[symbol], email_creds)
+                    process_symbol(symbol, token, INSTRUMENT_CONFIG[symbol], email_creds, config)
             
-            # Wake up every 60 seconds to check for active trade targets/stops
             time.sleep(60)
 
     except KeyboardInterrupt:
