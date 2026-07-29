@@ -34,24 +34,22 @@ def get_front_month_future(symbol_prefix):
     return None
 
 def resample_candles(df, timeframe):
-    """Bulletproof resampling that handles capitalization and missing volume columns."""
+    """Bulletproof resampling with a zero-volume guard for VWAP."""
     if df.empty: return df
     
-    # 1. Force all column names to lowercase to fix the KeyError
     df.columns = df.columns.str.lower()
     
-    # 2. Safety fallback if the fetcher dropped the volume column entirely
+    # VWAP Guard: Prevent VWAP from dividing by zero and generating NaNs
     if 'volume' not in df.columns:
-        df['volume'] = 0
+        df['volume'] = 1
+    df['volume'] = df['volume'].replace(0, 1)
         
-    # 3. Ensure the index is a proper DateTime index
     if not isinstance(df.index, pd.DatetimeIndex):
         time_cols = [c for c in df.columns if c in ['timestamp', 'date', 'datetime']]
         if time_cols:
             df.set_index(time_cols[0], inplace=True)
         df.index = pd.to_datetime(df.index)
         
-    # 4. Perform the resample
     agg_dict = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
     df_resampled = df.resample(timeframe).agg(agg_dict)
     
@@ -61,9 +59,19 @@ def calculate_vwap_ema_indicators(df):
     if df.empty: return df
     df['EMA_9'] = ta.ema(df['close'], length=9)
     df['EMA_21'] = ta.ema(df['close'], length=21)
-    df['VWAP'] = ta.vwap(df['high'], df['low'], df['close'], df['volume'], anchor='D')
+    
+    # Calculate VWAP
+    vwap_series = ta.vwap(df['high'], df['low'], df['close'], df['volume'], anchor='D')
+    if vwap_series is not None and not vwap_series.empty:
+        df['VWAP'] = vwap_series
+    else:
+        # Fallback to typical price if VWAP generation fails
+        df['VWAP'] = (df['high'] + df['low'] + df['close']) / 3
+        
     df['volume_prev'] = df['volume'].shift(1)
-    return df.dropna()
+    
+    # Only drop rows where our specific indicators are NaN (to clear the EMA warmup period)
+    return df.dropna(subset=['EMA_21', 'VWAP'])
 
 def run_vwap_debugger(symbol="NIFTY"):
     config_file = os.path.join(BASE_DIR, "scanner_config.json")
@@ -88,15 +96,17 @@ def run_vwap_debugger(symbol="NIFTY"):
     print(f"✅ Resolved Contract: {future_key}")
 
     now = datetime.now(IST)
-    start_str = (now - timedelta(days=5)).strftime('%Y-%m-%d')
+    # INCREASED to 10 days to guarantee EMA 21 has enough warmup candles
+    start_str = (now - timedelta(days=10)).strftime('%Y-%m-%d')
     today_str = now.strftime('%Y-%m-%d')
 
-    # Hooking directly into your proven candle fetcher
     df_1m = fetch_candle_chunk(future_key, start_str, today_str, token, interval='1minute', logger=print)
     
     if df_1m.empty:
         print(f"❌ No data returned from API for {symbol}.")
         return
+
+    print(f"📊 Downloaded {len(df_1m)} 1-minute candles. Processing...")
 
     df_3m = resample_candles(df_1m, '3min')
     df_15m = resample_candles(df_1m, '15min')
@@ -105,7 +115,7 @@ def run_vwap_debugger(symbol="NIFTY"):
     df_15m = calculate_vwap_ema_indicators(df_15m)
     
     if len(df_3m) < 3 or len(df_15m) < 2: 
-        print("❌ Not enough data to build indicator history.")
+        print(f"❌ Not enough valid indicator rows generated. 3m rows: {len(df_3m)}, 15m rows: {len(df_15m)}")
         return
         
     df_15m = df_15m.add_suffix('_15m')
